@@ -476,4 +476,150 @@ try {
     '补切超限错误应指出订单 / 零件 / 件号：' + e.message);
 }
 
+// ---- 临时余板库存 ----
+
+// 25) 余板启用顺序：已开板无落位时按输入顺序逐块启用余板，每块最多使用一次；
+//     最后才开标准新板，且材料费只计标准新板
+const rmBase = {
+  boardWidth: 1200, boardHeight: 800, kerf: 0, boardPrice: 100,
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 6 }] }],
+  remnants: [
+    { id: 'R1', width: 600, height: 400 },
+    { id: 'R2', width: 600, height: 400 },
+  ],
+};
+const rm = cutBoards(rmBase);
+assert.deepStrictEqual(
+  rm.boards.map((b) => [b.kind, b.remnantId || null, b.width, b.height, b.placements.length]),
+  [
+    ['remnant', 'R1', 600, 400, 1],
+    ['remnant', 'R2', 600, 400, 1],
+    ['standard', null, 1200, 800, 4],
+  ]
+);
+assert.strictEqual(rm.boardsCount, 3);
+assert.strictEqual(rm.standardBoardsCount, 1);
+assert.deepStrictEqual(rm.remnants.used.map((u) => [u.id, u.board]), [['R1', 1], ['R2', 2]]);
+assert.deepStrictEqual(rm.remnants.unused, []);
+// 余板板价计 0，材料费只对 1 张新增标准板计费
+assert.strictEqual(rm.boards[0].cost.priceCents, 0);
+assert.strictEqual(rm.boards[1].cost.priceCents, 0);
+assert.strictEqual(rm.boards[2].cost.priceCents, 10000);
+assert.strictEqual(rm.totalMaterialCents, 10000);
+// 总面积 / 利用率按各板实际尺寸求和
+assert.strictEqual(rm.totalArea, 600 * 400 * 2 + 1200 * 800);
+// 各板面积守恒、零件不越界
+for (const b of rm.boards) {
+  assert(Math.abs(b.width * b.height - b.partsArea - b.kerfArea - b.remainderArea) < 0.01,
+    `余板方案板 ${b.index} 面积不守恒`);
+  for (const p of b.placements) {
+    assert(p.x + p.w <= b.width + 1e-6 && p.y + p.h <= b.height + 1e-6, '余板方案零件越界');
+  }
+}
+
+// 26) 已开板（含已启用余板）的可用矩形优先回填，已启用余板不重复耗用，
+//     几何 / 刀长不可行的余板保持未用并跳过
+const rmBackfill = cutBoards({
+  boardWidth: 5000, boardHeight: 5000, kerf: 0,
+  orders: [{ orderNo: 'A', parts: [
+    { name: 'a', width: 500, height: 500, quantity: 1 },
+    { name: 'c', width: 400, height: 400, quantity: 1 },
+  ] }],
+  remnants: [
+    { id: 'R1', width: 1000, height: 1000 },
+    { id: 'R2', width: 200, height: 200 }, // 两件都放不下，永不启用
+  ],
+});
+assert.strictEqual(rmBackfill.boardsCount, 1);
+assert.strictEqual(rmBackfill.boards[0].kind, 'remnant');
+assert.strictEqual(rmBackfill.boards[0].remnantId, 'R1');
+assert.strictEqual(rmBackfill.boards[0].placements.length, 2);
+assert.deepStrictEqual(rmBackfill.remnants.used.map((u) => u.id), ['R1']);
+assert.deepStrictEqual(rmBackfill.remnants.unused.map((u) => u.id), ['R2']);
+assert.strictEqual(rmBackfill.standardBoardsCount, 0);
+
+// 27) 单刀长度限制对余板同样生效：超限余板跳过，取输入顺序中第一块可行余板
+const rmLimit = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 0, maxCutLength: 300,
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 1 }] }],
+  remnants: [
+    { id: 'BIG', width: 700, height: 500 },  // 需 700 刀，超限 → 跳过且保持未用
+    { id: 'FIT', width: 600, height: 400 },  // 恰好铺满，无刀 → 可行
+  ],
+});
+assert.strictEqual(rmLimit.boardsCount, 1);
+assert.strictEqual(rmLimit.boards[0].remnantId, 'FIT');
+assert.deepStrictEqual(rmLimit.remnants.used.map((u) => u.id), ['FIT']);
+assert.deepStrictEqual(rmLimit.remnants.unused.map((u) => u.id), ['BIG']);
+assert.strictEqual(rmLimit.standardBoardsCount, 0);
+
+// 28) 标准板放不下、旋转后能放入余板：放宽整体校验，余板旋转落位
+const rmRot = cutBoards({
+  boardWidth: 400, boardHeight: 300, kerf: 0,
+  orders: [{ orderNo: 'A', parts: [{ name: '条', width: 350, height: 380, quantity: 1 }] }],
+  remnants: [{ id: 'R1', width: 500, height: 500 }],
+});
+assert.strictEqual(rmRot.boardsCount, 1);
+assert.strictEqual(rmRot.boards[0].kind, 'remnant');
+
+// 29) 标准新板与所有可行余板均超单刀上限：报错并按输入顺序列出已尝试余板
+let rmErr = '';
+try {
+  cutBoards({
+    boardWidth: 1200, boardHeight: 800, kerf: 0, maxCutLength: 300,
+    orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 1 }] }],
+    remnants: [
+      { id: 'R1', width: 700, height: 500 },
+      { id: 'R2', width: 601, height: 401 },
+    ],
+  });
+  assert.fail('余板 / 新板均超限应报错');
+} catch (e) {
+  assert(e instanceof UserError);
+  rmErr = e.message;
+}
+assert(/A/.test(rmErr) && /块/.test(rmErr) && /第 1 件/.test(rmErr), '报错应指出订单 / 零件 / 件号：' + rmErr);
+assert(/R1/.test(rmErr) && /R2/.test(rmErr), '报错应列出已尝试余板：' + rmErr);
+
+// 30) 余板输入校验：编号重复（含自动编号撞名）、长宽非正、格式错误
+assert.throws(() => cutBoards({
+  boardWidth: 1000, boardHeight: 1000,
+  orders: [{ orderNo: 'A', parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }] }],
+  remnants: [{ id: 'X', width: 1, height: 1 }, { id: 'X', width: 2, height: 2 }],
+}), UserError, '余板编号重复应报错');
+assert.throws(() => cutBoards({
+  boardWidth: 1000, boardHeight: 1000,
+  orders: [{ orderNo: 'A', parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }] }],
+  remnants: [{ id: 'X', width: 0, height: 1 }],
+}), UserError, '余板长度非正应报错');
+assert.throws(() => cutBoards({
+  boardWidth: 1000, boardHeight: 1000,
+  orders: [{ orderNo: 'A', parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }] }],
+  remnants: [{ id: '余板2', width: 1, height: 1 }, { width: 2, height: 2 }],
+}), UserError, '自动编号与显式编号撞名应报错');
+// 编号留空自动补“余板N”（标准板放不下、只有余板能加工，确保余板被启用）
+const rmAuto = cutBoards({
+  boardWidth: 400, boardHeight: 400,
+  orders: [{ orderNo: 'A', parts: [{ name: 'a', width: 450, height: 450, quantity: 1 }] }],
+  remnants: [{ width: 500, height: 500 }],
+});
+assert.deepStrictEqual(rmAuto.remnants.used.map((u) => u.id), ['余板1']);
+
+// 31) 缺件补切独立使用标准新板：不消耗余板库存；原方案重算仍可用余板
+const rmRecutBase = {
+  boardWidth: 1200, boardHeight: 800, kerf: 0, boardPrice: 100,
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 5 }] }],
+  remnants: [{ id: 'R1', width: 600, height: 400 }],
+};
+const rmRc = recutBoards({ ...rmRecutBase, damaged: [{ order: 'A', part: '块', index: 1 }] });
+assert.deepStrictEqual(rmRc.original.remnants.used.map((u) => u.id), ['R1']);
+assert.strictEqual(rmRc.recut.addedBoards, 1);
+assert.strictEqual(rmRc.recut.boards[0].kind, 'standard');
+assert.strictEqual(rmRc.recut.boards[0].width, 1200);
+assert.strictEqual(rmRc.recut.addedMaterialCents, 10000);
+// 补切板不携带余板身份
+assert.strictEqual(rmRc.recut.boards[0].remnantId, undefined);
+// 原方案与直接计算完全一致（落位 / 分摊不变）
+assert.deepStrictEqual(rmRc.original, cutBoards(rmRecutBase));
+
 console.log('全部算法自检通过 ✔');

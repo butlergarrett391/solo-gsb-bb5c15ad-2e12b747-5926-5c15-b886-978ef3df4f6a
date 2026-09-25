@@ -15,6 +15,11 @@
  *  - 每一刀都贯穿其所在的当前矩形区域；沿板材边缘的修整切也会被记录（缝宽可能小于
  *    标准锯缝，因为余边不足一条完整锯缝）。零件恰好占满方向时不产生该方向的刀。
  *  - 零件在所有已开板材上都放不下时才开启新板；全部板材均无法容纳的零件直接报错。
+ *  - 可选临时余板库存 remnants（每块带唯一编号、长宽均为正数）：零件在所有已用板
+ *    （含之前已启用的余板）的可用矩形中都找不到可行断头切落位时，依余板输入顺序
+ *    尝试尚未使用且能加工（几何可容纳且刀长不超限）的余板；每块余板最多使用一次；
+ *    余板也不可行时最后才开标准新板。余板与新板遵守相同的锯缝、旋转与单刀限制，
+ *    按余板实际尺寸绘图 / 统计；余板板价计 0，材料费只对新增标准板分摊。
  *  - 可选设备最大单刀长度 maxCutLength（留空 = 不限制）：在每个候选落位与朝向下分别
  *    计算竖切优先、横切优先两种切法中各刀的实际刀长，仅当一种切法的所有刀长均不超过
  *    上限时该切法才可行；再从可行切法中按现有规则（余料面积 / 评分）选取。现有板无可行
@@ -32,6 +37,7 @@
  *    校验所选件存在且无重复；
  *  - 仅将所选件按原始尺寸与原输入顺序（订单 → 零件行 → 件号）合并，
  *    重排为独立的补切方案（新增板单独计费），不改动原方案任何落位；
+ *  - 补切独立使用标准新板，不消耗临时余板库存（即便请求携带 remnants）；
  *  - 补切清单逐件关联原板号与新板号，并给出新增板数与新增材料费。
  */
 
@@ -181,10 +187,12 @@ function buildSplit(fr, w, h, k, verticalFirst) {
   return { cuts, rects, freeArea };
 }
 
-function makeBoard(width, height) {
+function makeBoard(width, height, kind = 'standard', remnantId = null) {
   return {
     width,
     height,
+    kind, // 'standard' 标准新板 / 'remnant' 临时余板
+    remnantId,
     free: [{ x: 0, y: 0, w: width, h: height }],
     placements: [],
     cuts: [],
@@ -259,9 +267,44 @@ function apportionBoardCost(priceCents, entries) {
 }
 
 /**
- * 解析并校验排料输入（多订单 / 旧版单订单），返回归一化参数与展平的零件行。
+ * 解析临时余板库存（选填）：每块余板带唯一编号、长宽均为正数。
+ * 返回 [{ id, width, height }]，顺序与输入一致（排料时按此顺序启用）；
+ * 编号留空时按“余板1、余板2…”自动编号，编号重复（含与自动编号撞名）即报错。
+ */
+function parseRemnants(input) {
+  if (input.remnants === undefined || input.remnants === null) return [];
+  if (!Array.isArray(input.remnants)) {
+    throw new UserError('余板清单格式不正确');
+  }
+  if (input.remnants.length > 500) {
+    throw new UserError('余板数量过多（最多 500 块）');
+  }
+  const remnants = [];
+  const usedIds = new Set();
+  input.remnants.forEach((r, i) => {
+    if (!r || typeof r !== 'object') {
+      throw new UserError(`第 ${i + 1} 块余板格式不正确`);
+    }
+    const rawId = r.id === undefined || r.id === null ? '' : String(r.id).trim();
+    const id = rawId === '' ? `余板${i + 1}` : rawId;
+    if (usedIds.has(id)) {
+      throw new UserError(`余板编号重复：${id}`);
+    }
+    usedIds.add(id);
+    const w = num(r.width, `余板「${id}」的长度`);
+    const h = num(r.height, `余板「${id}」的宽度`);
+    if (w <= 0) throw new UserError(`余板「${id}」的长度必须大于 0`);
+    if (h <= 0) throw new UserError(`余板「${id}」的宽度必须大于 0`);
+    remnants.push({ id, width: w, height: h });
+  });
+  return remnants;
+}
+
+/**
+ * 解析排料输入（多订单 / 旧版单订单），返回归一化参数与展平的零件行。
  * groups：[{ order, seq(订单顺序), name, width, height, quantity }]，按输入顺序排列；
- * ordersList：[{ order, seq }]，按订单输入顺序去重。
+ * ordersList：[{ order, seq }]，按订单输入顺序去重；
+ * remnants：临时余板库存 [{ id, width, height }]，按输入顺序排列。
  */
 function parseInput(input) {
   if (!input || typeof input !== 'object') {
@@ -275,10 +318,18 @@ function parseInput(input) {
     : num(input.kerf, '锯缝宽度');
   const boardPriceCents = priceToCents(input.boardPrice);
   const maxCutLength = parseMaxCutLength(input.maxCutLength);
+  const remnants = parseRemnants(input);
 
   if (boardWidth <= 0) throw new UserError('原板长度必须大于 0');
   if (boardHeight <= 0) throw new UserError('原板宽度必须大于 0');
   if (kerf < 0) throw new UserError('锯缝宽度不能为负数');
+
+  // 零件旋转后能否放入某块矩形板（标准新板或任意余板）
+  const fitsBoard = (w, h, bw, bh) =>
+    (w <= bw + EPS && h <= bh + EPS) || (h <= bw + EPS && w <= bh + EPS);
+  const fitsAnywhere = (w, h) =>
+    fitsBoard(w, h, boardWidth, boardHeight) ||
+    remnants.some((r) => fitsBoard(w, h, r.width, r.height));
 
   // 归一化订单：旧版顶层 parts → 单个订单
   let rawOrders;
@@ -340,12 +391,11 @@ function parseInput(input) {
       if (w <= 0) throw new UserError(`订单「${orderNo}」零件「${name}」的长度必须大于 0`);
       if (h <= 0) throw new UserError(`订单「${orderNo}」零件「${name}」的宽度必须大于 0`);
 
-      // 旋转后仍无法放入整板，直接报错
-      const fitsNormal = w <= boardWidth + EPS && h <= boardHeight + EPS;
-      const fitsRotated = h <= boardWidth + EPS && w <= boardHeight + EPS;
-      if (!fitsNormal && !fitsRotated) {
+      // 旋转后既无法放入标准新板、也无法放入任何余板，直接报错
+      if (!fitsAnywhere(w, h)) {
         throw new UserError(
-          `订单「${orderNo}」零件「${name}」尺寸 ${w} × ${h} 旋转后仍无法放入原板 ${boardWidth} × ${boardHeight}`
+          `订单「${orderNo}」零件「${name}」尺寸 ${w} × ${h} 旋转后仍无法放入原板 ${boardWidth} × ${boardHeight}` +
+          (remnants.length ? '或任何余板' : '')
         );
       }
 
@@ -368,6 +418,7 @@ function parseInput(input) {
     kerf,
     boardPriceCents,
     maxCutLength,
+    remnants,
     groups,
     ordersList,
     totalQty,
@@ -385,9 +436,18 @@ function parseInput(input) {
  * 实际刀长；仅当一种切法中所有刀长均不超过上限时，该切法才可行。
  * 同一落位 + 朝向下竖切优先、横切优先之间，沿用“锯缝损耗更小（余料面积更大）”
  * 的现有规则选取（平局取竖切）；落位 / 朝向之间沿用现有评分规则。
+ *
+ * remnants：临时余板库存 [{ id, width, height }]（按输入顺序）。零件在所有已开板
+ * （含之前已启用的余板）的可用矩形中都找不到可行断头切落位时，依输入顺序尝试
+ * 尚未使用、且几何上能容纳并能在 maxCutLength 内加工该零件的余板；每块余板最多
+ * 启用一次；余板也不可行时最后才开标准新板。
+ *
+ * 返回 { boards, usedRemnantIds }。
  */
-function layoutParts(boardWidth, boardHeight, kerf, groups, maxCutLength) {
+function layoutParts(boardWidth, boardHeight, kerf, groups, maxCutLength, remnants = []) {
   const boards = [];
+  const usedRemnantIndices = new Set();
+  const usedRemnantIds = [];
 
   // 枚举某零件在指定可用矩形 + 朝向下的可行切法（按现有规则：余料面积大的优先，平局取竖切）
   const feasibleSplit = (fr, ori) => {
@@ -404,33 +464,45 @@ function layoutParts(boardWidth, boardHeight, kerf, groups, maxCutLength) {
     return hSplit.freeArea > vSplit.freeArea + EPS ? hSplit : vSplit;
   };
 
-  // 现有板均无可行落位时在新板上尝试；新板也无法加工时给出订单 / 零件 / 件号
+  // 已开板、余板均无可行落位时，标准新板也无法加工；给出订单 / 零件 / 件号
   const failPart = (part, index) => {
-    if (maxCutLength === null) {
-      throw new UserError(
-        `订单「${part.order}」零件「${part.name}」尺寸 ${part.width} × ${part.height} 无法放入原板 ${boardWidth} × ${boardHeight}`
-      );
-    }
-    // 给出几何上能放入整板的朝向中，两种切法各自所需的最小刀长上确界，便于现场判断
-    const fr = { x: 0, y: 0, w: boardWidth, h: boardHeight };
+    // 几何上能放入某块整板（标准新板或余板）的朝向中，两种切法各自所需的最小刀长上确界
     const oris = [{ w: part.width, h: part.height, rotated: false }];
     if (Math.abs(part.width - part.height) > EPS) {
       oris.push({ w: part.height, h: part.width, rotated: true });
     }
-    const needs = [];
-    for (const ori of oris) {
-      if (ori.w > fr.w + EPS || ori.h > fr.h + EPS) continue;
-      const w = Math.min(ori.w, fr.w);
-      const h = Math.min(ori.h, fr.h);
-      const maxLen = (verticalFirst) => {
-        const s = buildSplit(fr, w, h, kerf, verticalFirst);
-        return s.cuts.length ? Math.max(...cutLengths(s)) : 0;
-      };
-      needs.push(`${ori.rotated ? '旋转' : '不旋转'}朝向下竖切优先需单刀 ${round3(maxLen(true))}、横切优先需单刀 ${round3(maxLen(false))}`);
+    const needsOn = (bw, bh) => {
+      const fr = { x: 0, y: 0, w: bw, h: bh };
+      const rows = [];
+      for (const ori of oris) {
+        if (ori.w > fr.w + EPS || ori.h > fr.h + EPS) continue;
+        const w = Math.min(ori.w, fr.w);
+        const h = Math.min(ori.h, fr.h);
+        const maxLen = (verticalFirst) => {
+          const s = buildSplit(fr, w, h, kerf, verticalFirst);
+          return s.cuts.length ? Math.max(...cutLengths(s)) : 0;
+        };
+        rows.push(`${ori.rotated ? '旋转' : '不旋转'}朝向下竖切优先需单刀 ${round3(maxLen(true))}、横切优先需单刀 ${round3(maxLen(false))}`);
+      }
+      return rows;
+    };
+
+    if (maxCutLength === null) {
+      throw new UserError(
+        `订单「${part.order}」零件「${part.name}」尺寸 ${part.width} × ${part.height} 无法放入原板 ${boardWidth} × ${boardHeight}` +
+        (remnants.length ? '或任何余板' : '')
+      );
     }
+
+    const needs = needsOn(boardWidth, boardHeight);
+    // 已按输入顺序尝试过所有几何上能容纳该件的余板（含超刀长被拒），错误信息中列出
+    const capableIds = remnants
+      .filter((r) => oris.some((o) => o.w <= r.width + EPS && o.h <= r.height + EPS))
+      .map((r) => r.id);
     throw new UserError(
       `订单「${part.order}」零件「${part.name}」第 ${index} 件无法在最大单刀长度 ${maxCutLength} 内加工` +
-      (needs.length ? `（${needs.join('；')}）` : '（零件旋转后仍大于原板）')
+      (needs.length ? `（标准新板 ${boardWidth} × ${boardHeight}：${needs.join('；')}）` : '（零件旋转后仍大于标准新板）') +
+      (capableIds.length ? `；已依次尝试余板 ${capableIds.join('、')}，均无法在上限内加工` : '')
     );
   };
 
@@ -477,7 +549,31 @@ function layoutParts(boardWidth, boardHeight, kerf, groups, maxCutLength) {
         }
       }
 
-      // 现有板材均无可行落位（放不下或刀长超限）→ 开新板再试
+      // 所有已开板（含已启用余板）均无可行落位 → 依输入顺序尝试尚未使用且能加工的余板
+      if (!best) {
+        for (let ri = 0; ri < remnants.length; ri++) {
+          if (usedRemnantIndices.has(ri)) continue; // 每块余板最多使用一次
+          const r = remnants[ri];
+          const board = makeBoard(r.width, r.height, 'remnant', r.id);
+          const fr = board.free[0];
+          // 非旋转优先（正方形只有一个朝向）；仅考虑刀长不超限的切法
+          let newBest = null;
+          for (const ori of orientations) {
+            if (ori.w > fr.w + EPS || ori.h > fr.h + EPS) continue;
+            const split = feasibleSplit(fr, ori);
+            if (!split) continue;
+            if (!newBest) newBest = { ori, split };
+          }
+          if (!newBest) continue; // 该余板几何不足或刀长超限 → 保持未使用，继续尝试下一块
+          usedRemnantIndices.add(ri);
+          usedRemnantIds.push(r.id);
+          boards.push(board);
+          best = { boardIndex: boards.length - 1, freeIndex: 0, ori: newBest.ori, split: newBest.split, fr };
+          break;
+        }
+      }
+
+      // 余板也都不可行 → 最后才开标准新板
       if (!best) {
         const board = makeBoard(boardWidth, boardHeight);
         const fr = board.free[0];
@@ -524,7 +620,7 @@ function layoutParts(boardWidth, boardHeight, kerf, groups, maxCutLength) {
     }
   }
 
-  return boards;
+  return { boards, usedRemnantIds };
 }
 
 // 输出统一保留 3 位小数，0 归一
@@ -548,6 +644,9 @@ function summarizeBoards(boards, boardPriceCents, ordersList) {
     });
   });
 
+  // 材料费只对新增标准板按单板价分摊；余板为既有库存，板价计 0
+  const priceOf = (b) => (b.kind === 'remnant' ? 0 : boardPriceCents);
+
   const resultBoards = boards.map((b, bi) => {
     const cuts = b.cuts.map((c, i) => {
       const seq = i + 1;
@@ -563,10 +662,11 @@ function summarizeBoards(boards, boardPriceCents, ordersList) {
 
     const boardArea = b.width * b.height;
     const remainderArea = boardArea - b.partsArea - b.kerfArea;
+    const boardPrice = priceOf(b);
 
-    // 逐板按订单面积比例分摊板价（最大余数法，同余按订单输入顺序）
+    // 逐板按订单面积比例分摊板价（最大余数法，同余按订单输入顺序）；余板板价为 0
     const shareRows = apportionBoardCost(
-      boardPriceCents,
+      boardPrice,
       [...b.orderAreas.entries()].map(([order, area]) => ({
         order,
         area,
@@ -592,6 +692,8 @@ function summarizeBoards(boards, boardPriceCents, ordersList) {
 
     return {
       index: bi + 1,
+      kind: b.kind,
+      ...(b.kind === 'remnant' ? { remnantId: b.remnantId } : {}),
       width: round3(b.width),
       height: round3(b.height),
       longestCut: cuts.length ? round3(Math.max(...cuts.map((c) => c.length))) : 0,
@@ -612,7 +714,7 @@ function summarizeBoards(boards, boardPriceCents, ordersList) {
       remainderArea: round3(remainderArea),
       utilization: Math.round((b.partsArea / boardArea) * 1000) / 10,
       cost: {
-        priceCents: boardPriceCents,
+        priceCents: boardPrice,
         shares,
       },
     };
@@ -646,9 +748,11 @@ function orderSummaryRows(orderSummary) {
  */
 function cutBoards(input) {
   const parsed = parseInput(input);
-  const { boardWidth, boardHeight, kerf, boardPriceCents, maxCutLength } = parsed;
+  const { boardWidth, boardHeight, kerf, boardPriceCents, maxCutLength, remnants } = parsed;
 
-  const boards = layoutParts(boardWidth, boardHeight, kerf, parsed.groups, maxCutLength);
+  const { boards, usedRemnantIds } = layoutParts(
+    boardWidth, boardHeight, kerf, parsed.groups, maxCutLength, remnants
+  );
   const { resultBoards, orderSummary } = summarizeBoards(boards, boardPriceCents, parsed.ordersList);
 
   // 分单取件清单：按订单输入顺序，件内按零件行 / 件号（即切割输入顺序）
@@ -676,11 +780,26 @@ function cutBoards(input) {
 
   const orders = orderSummaryRows(orderSummary);
 
-  const totalArea = boards.length * boardWidth * boardHeight;
+  const standardBoards = boards.filter((b) => b.kind !== 'remnant');
+  // 总面积按各板实际尺寸（余板尺寸不同于标准板）求和
+  const totalArea = boards.reduce((s, b) => s + b.width * b.height, 0);
   const partsArea = resultBoards.reduce((s, b) => s + b.partsArea, 0);
   const kerfArea = resultBoards.reduce((s, b) => s + b.kerfArea, 0);
   const remainderArea = totalArea - partsArea - kerfArea;
-  const totalMaterialCents = boards.length * boardPriceCents;
+  // 材料费只对新增标准板计费：余板是既有库存，不重复计费
+  const totalMaterialCents = standardBoards.length * boardPriceCents;
+
+  // 余板已用 / 未用清单：按余板输入顺序排列；已用余板给出其在整体板序中的板号
+  const usedIdSet = new Set(usedRemnantIds);
+  const usedRemnants = remnants
+    .filter((r) => usedIdSet.has(r.id))
+    .map((r) => {
+      const rb = resultBoards.find((b) => b.kind === 'remnant' && b.remnantId === r.id);
+      return { id: r.id, width: round3(r.width), height: round3(r.height), board: rb.index };
+    });
+  const unusedRemnants = remnants
+    .filter((r) => !usedIdSet.has(r.id))
+    .map((r) => ({ id: r.id, width: round3(r.width), height: round3(r.height) }));
 
   return {
     mode: parsed.legacy ? 'single' : 'orders',
@@ -690,13 +809,18 @@ function cutBoards(input) {
     boardPrice: round3(boardPriceCents / 100),
     maxCutLength: maxCutLength === null ? null : round3(maxCutLength),
     boardsCount: boards.length,
+    standardBoardsCount: standardBoards.length,
     totalParts: parsed.totalQty,
     totalArea: round3(totalArea),
     partsArea: round3(partsArea),
     kerfArea: round3(kerfArea),
     remainderArea: round3(remainderArea),
-    utilization: Math.round((partsArea / totalArea) * 1000) / 10,
+    utilization: totalArea > 0 ? Math.round((partsArea / totalArea) * 1000) / 10 : 0,
     totalMaterialCents,
+    remnants: {
+      used: usedRemnants,
+      unused: unusedRemnants,
+    },
     orders,
     pickList,
     boards: resultBoards,
@@ -807,7 +931,8 @@ function recutBoards(input) {
     tag: { index: s.index, srcBoard: s.srcBoard },
   }));
 
-  const boards = layoutParts(boardWidth, boardHeight, kerf, recutGroups, maxCutLength);
+  // 补切独立使用标准新板：不消耗临时余板库存（传空余板列表）
+  const { boards } = layoutParts(boardWidth, boardHeight, kerf, recutGroups, maxCutLength, []);
 
   // 补切订单汇总仅含涉及订单，顺序仍按原订单输入顺序
   const recutOrdersList = [];

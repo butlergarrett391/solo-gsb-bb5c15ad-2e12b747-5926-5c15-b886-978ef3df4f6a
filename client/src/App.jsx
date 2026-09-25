@@ -3,6 +3,12 @@ import BoardDiagram, { partColor } from './BoardDiagram.jsx';
 
 const SAMPLE_BOARD = { boardWidth: 2440, boardHeight: 1220, kerf: 3, boardPrice: 180 };
 
+// 临时余板库存示例：YB-01 能被本单使用，YB-02 过小保持未用（同时演示已用 / 未用）
+const SAMPLE_REMNANTS = [
+  { id: 'YB-01', width: 700, height: 500 },
+  { id: 'YB-02', width: 450, height: 300 },
+];
+
 const SAMPLE_ORDERS = [
   {
     orderNo: 'SO-1001',
@@ -23,6 +29,7 @@ const SAMPLE_ORDERS = [
 ];
 
 const EMPTY_PART = { name: '', width: '', height: '', quantity: 1 };
+const EMPTY_REMNANT = { id: '', width: '', height: '' };
 const emptyOrder = (i) => ({ orderNo: '', parts: [{ ...EMPTY_PART }] });
 
 // 损坏件三元身份：订单号 + 零件名 + 件号（跨订单同名零件互不影响）
@@ -46,6 +53,8 @@ export default function App() {
     orderNo: o.orderNo,
     parts: o.parts.map((p) => ({ ...p })),
   })));
+  // 临时余板库存（选填）：每行一块带唯一编号的余板，长宽均需为正数
+  const [remnants, setRemnants] = useState(SAMPLE_REMNANTS.map((r) => ({ ...r })));
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -79,6 +88,44 @@ export default function App() {
     }));
   };
 
+  // ---- 临时余板库存编辑 ----
+  const updateRemnant = (ri, key, value) => {
+    setRemnants((prev) => prev.map((r, idx) => (idx === ri ? { ...r, [key]: value } : r)));
+  };
+  const addRemnant = () => setRemnants((prev) => [...prev, { ...EMPTY_REMNANT }]);
+  const removeRemnant = (ri) => setRemnants((prev) => prev.filter((_, idx) => idx !== ri));
+
+  // 余板清单校验：编号唯一、长宽均为正数；整行留空视为未录入，直接剔除
+  const collectRemnants = () => {
+    const list = [];
+    const ids = new Set();
+    for (let i = 0; i < remnants.length; i++) {
+      const r = remnants[i];
+      const id = String(r.id ?? '').trim();
+      const ws = String(r.width ?? '').trim();
+      const hs = String(r.height ?? '').trim();
+      if (id === '' && ws === '' && hs === '') continue; // 空行忽略
+      const w = Number(ws);
+      const h = Number(hs);
+      if (ws === '' || hs === '') {
+        throw new Error(`第 ${i + 1} 块余板长度与宽度需填写完整（整行留空可不填）`);
+      }
+      if (!Number.isFinite(w) || w <= 0) {
+        throw new Error(`余板「${id || i + 1}」的长度必须是正数`);
+      }
+      if (!Number.isFinite(h) || h <= 0) {
+        throw new Error(`余板「${id || i + 1}」的宽度必须是正数`);
+      }
+      const key = id || `余板${i + 1}`;
+      if (ids.has(key)) {
+        throw new Error(`余板编号重复：${id}`);
+      }
+      ids.add(key);
+      list.push({ id, width: w, height: h });
+    }
+    return list;
+  };
+
   const resetRecut = () => {
     setSelected(new Set());
     setRecut(null);
@@ -92,6 +139,7 @@ export default function App() {
     setBoardPrice(String(SAMPLE_BOARD.boardPrice));
     setMaxCutLength('');
     setOrders(SAMPLE_ORDERS.map((o) => ({ orderNo: o.orderNo, parts: o.parts.map((p) => ({ ...p })) })));
+    setRemnants(SAMPLE_REMNANTS.map((r) => ({ ...r })));
     setResult(null);
     setError('');
     resetRecut();
@@ -113,6 +161,7 @@ export default function App() {
         quantity: Number(p.quantity),
       })),
     })),
+    remnants: collectRemnants(),
   });
 
   const submit = async (e) => {
@@ -122,6 +171,13 @@ export default function App() {
       setError('设备最大单刀长度必须为正数（留空则不限制）');
       return;
     }
+    let payload;
+    try {
+      payload = currentPayload();
+    } catch (err) {
+      setError(err.message);
+      return;
+    }
     setResult(null);
     resetRecut();
     setLoading(true);
@@ -129,7 +185,7 @@ export default function App() {
       const res = await fetch('/api/cut', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(currentPayload()),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
@@ -161,6 +217,13 @@ export default function App() {
       setRecutError('设备最大单刀长度必须为正数（留空则不限制）');
       return;
     }
+    let payload;
+    try {
+      payload = currentPayload();
+    } catch (err) {
+      setRecutError(err.message);
+      return;
+    }
     setRecut(null);
     setRecutLoading(true);
     // 按分单取件清单顺序收集选中的损坏件（三元身份）
@@ -173,11 +236,12 @@ export default function App() {
       }
     }
     try {
-      // 提交时以当前排料输入为准，后端重新计算原方案并校验所选件
+      // 提交时以当前排料输入为准，后端重新计算原方案并校验所选件；
+      // 补切独立使用标准新板，payload 中的余板库存不会被补切耗用
       const res = await fetch('/api/recut', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...currentPayload(), damaged }),
+        body: JSON.stringify({ ...payload, damaged }),
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
@@ -238,6 +302,41 @@ export default function App() {
               系统会对每个候选落位与朝向分别核算竖切优先、横切优先的实际刀长，
               只有该切法<b>每一刀均不超过此上限</b>才会采用，不输出超限刀路。
             </p>
+
+            <div className="parts-head">
+              <h2>临时余板库存（{remnants.length}，选填）</h2>
+            </div>
+            <p className="hint">
+              逐块录入手边可用的余板：<b>编号唯一</b>（留空自动编号“余板N”）、
+              <b>长度 / 宽度均为正数</b>，尺寸按实际余板填写。排料仍严格按零件输入顺序：
+              先在<b>所有已用板</b>（含之前已启用的余板）的可用矩形中寻找断头切落位，
+              找不到时才依下表顺序尝试<b>尚未使用且能加工</b>的余板，最后才开标准新板；
+              每块余板最多使用一次，余板与新板同样遵守锯缝、旋转与单刀长度限制。
+              <b>余板为既有库存、不计材料费</b>，只有新增标准新板按单板价计费分摊。
+            </p>
+            {remnants.length > 0 && (
+              <div className="remnant-row remnant-row-head">
+                <span>余板编号</span>
+                <span>长度</span>
+                <span>宽度</span>
+                <span className="op-col"></span>
+              </div>
+            )}
+            <div className="remnants-list">
+              {remnants.map((r, ri) => (
+                <div className="remnant-row" key={ri}>
+                  <input type="text" value={r.id} placeholder={`余板${ri + 1}（留空自动编号）`}
+                    onChange={(e) => updateRemnant(ri, 'id', e.target.value)} />
+                  <input type="number" step="any" min="0" value={r.width}
+                    onChange={(e) => updateRemnant(ri, 'width', e.target.value)} />
+                  <input type="number" step="any" min="0" value={r.height}
+                    onChange={(e) => updateRemnant(ri, 'height', e.target.value)} />
+                  <button type="button" className="btn icon op-col" title="删除该余板"
+                    onClick={() => removeRemnant(ri)}>✕</button>
+                </div>
+              ))}
+            </div>
+            <button type="button" className="btn ghost wide" onClick={addRemnant}>＋ 添加余板</button>
 
             <div className="parts-head">
               <h2>订单清单（{orders.length}）</h2>
@@ -310,10 +409,12 @@ export default function App() {
               <p>填写左侧订单与零件后点击「生成多订单裁切方案」。</p>
               <ul>
                 <li>多个订单的零件混合拼版，按订单 / 零件行输入顺序断头切割</li>
+                <li>可登记多块带唯一编号的临时余板：已用板放不下时依序尝试余板，最后才开标准新板</li>
+                <li>逐板裁切图按各板实际尺寸绘制，列出余板已用 / 未用编号，余板不计材料费</li>
                 <li>逐板裁切图、零件落位表与刀序继续可用，色块左上角标注订单号</li>
                 <li>结果按订单列出跨板件号、所在板号与坐标，方便分单取件</li>
-                <li>每板材料费按订单零件面积比例分摊（最大余数法分配分位尾差）</li>
-                <li>在分单取件清单勾选损坏件，可生成独立的缺件补切方案</li>
+                <li>每张标准新板的材料费按订单零件面积比例分摊（最大余数法分配分位尾差）</li>
+                <li>在分单取件清单勾选损坏件，可生成独立的缺件补切方案（只开标准新板）</li>
               </ul>
             </div>
           )}
@@ -345,17 +446,21 @@ function ResultView({ result, selected, onToggleDamaged }) {
     <>
       <h2>排料结果</h2>
       <div className="stat-grid">
-        <div className="stat"><b>{result.boardsCount}</b><span>用板数</span></div>
+        <div className="stat"><b>{result.boardsCount}</b><span>用板总数</span></div>
+        <div className="stat accent"><b>{result.standardBoardsCount}</b><span>新增标准板</span></div>
+        <div className="stat accent"><b>{result.remnants.used.length}</b><span>耗用余板</span></div>
         <div className="stat"><b>{fmt(result.totalParts)}</b><span>零件总数</span></div>
         <div className="stat"><b>{fmt(result.partsArea)}</b><span>零件总面积</span></div>
         <div className="stat"><b>{fmt(result.kerfArea)}</b><span>锯缝损耗面积</span></div>
-        <div className="stat accent"><b>{fmt(result.remainderArea)}</b><span>余料总面积</span></div>
+        <div className="stat"><b>{fmt(result.remainderArea)}</b><span>余料总面积</span></div>
         <div className="stat"><b>{result.utilization}%</b><span>总利用率</span></div>
         <div className="stat accent"><b>¥{yuan(result.totalMaterialCents)}</b><span>材料费合计（{result.orders.length} 单）</span></div>
       </div>
       <p className="hint">
-        原板 {strip(result.boardWidth)} × {strip(result.boardHeight)}，
+        标准新板 {strip(result.boardWidth)} × {strip(result.boardHeight)}，
         单板材料价 ¥{yuan(result.boardPrice * 100)}；
+        <b>材料费仅按新增标准板计费</b>（{result.standardBoardsCount} 张 × ¥{yuan(result.boardPrice * 100)}
+        = ¥{yuan(result.totalMaterialCents)}），耗用的余板是既有库存、不计材料费；
         每板按各订单零件实际面积比例分摊，分位尾差用最大余数法（同余按订单输入顺序）。
         {result.maxCutLength != null ? (
           <>
@@ -370,6 +475,55 @@ function ResultView({ result, selected, onToggleDamaged }) {
           </>
         )}
       </p>
+
+      {(result.remnants.used.length > 0 || result.remnants.unused.length > 0) && (
+        <>
+          <h2 className="section-title">临时余板耗用情况</h2>
+          <div className="remnant-summary">
+            <div className="remnant-group used">
+              <h4>已用余板（{result.remnants.used.length}）· 不收取材料费</h4>
+              {result.remnants.used.length === 0 ? (
+                <p className="hint">本次排料未启用任何余板。</p>
+              ) : (
+                <table className="detail-table">
+                  <thead>
+                    <tr><th>余板编号</th><th>实际尺寸 长×宽</th><th>所在板号</th></tr>
+                  </thead>
+                  <tbody>
+                    {result.remnants.used.map((u) => (
+                      <tr key={u.id}>
+                        <td><b>{u.id}</b></td>
+                        <td>{strip(u.width)} × {strip(u.height)}</td>
+                        <td><span className="board-num remnant">{u.board}</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+            <div className="remnant-group unused">
+              <h4>未用余板（{result.remnants.unused.length}）· 退回库存</h4>
+              {result.remnants.unused.length === 0 ? (
+                <p className="hint">录入的余板已全部使用。</p>
+              ) : (
+                <table className="detail-table">
+                  <thead>
+                    <tr><th>余板编号</th><th>实际尺寸 长×宽</th></tr>
+                  </thead>
+                  <tbody>
+                    {result.remnants.unused.map((u) => (
+                      <tr key={u.id}>
+                        <td>{u.id}</td>
+                        <td>{strip(u.width)} × {strip(u.height)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+        </>
+      )}
 
       {/* 分单取件 */}
       <h2 className="section-title">分单取件清单</h2>
@@ -448,7 +602,7 @@ function ResultView({ result, selected, onToggleDamaged }) {
             <td>合计</td>
             <td>{result.totalParts}</td>
             <td>{fmt(result.partsArea)}</td>
-            <td>{result.boardsCount} 张板</td>
+            <td>{result.boardsCount} 张（新板 {result.standardBoardsCount} · 余板 {result.remnants.used.length}）</td>
             <td>¥{yuan(result.totalMaterialCents)}</td>
           </tr>
         </tbody>
@@ -466,14 +620,24 @@ function ResultView({ result, selected, onToggleDamaged }) {
         ))}
       </div>
 
-      {/* 逐板图与刀序 */}
+      {/* 逐板图与刀序（余板按其实际尺寸绘图） */}
       {result.boards.map((b) => (
-        <div className="board-card" key={b.index}>
+        <div className={`board-card${b.kind === 'remnant' ? ' remnant-board' : ''}`} key={b.index}>
           <h3>
-            第 {b.index} 张板 / 共 {result.boardsCount} 张
-            <span className="board-price">板价 ¥{yuan(b.cost.priceCents)}</span>
+            {b.kind === 'remnant' ? (
+              <>
+                第 {b.index} 张板 · 余板 <span className="remnant-tag">{b.remnantId}</span>
+                <span className="board-price">既有库存 · 不计材料费</span>
+              </>
+            ) : (
+              <>
+                第 {b.index} 张板 / 共 {result.boardsCount} 张 · 标准新板
+                <span className="board-price">板价 ¥{yuan(b.cost.priceCents)}</span>
+              </>
+            )}
           </h3>
-          <BoardDiagram board={b} boardWidth={result.boardWidth} boardHeight={result.boardHeight} />
+          <p className="hint">实际板尺寸 {strip(b.width)} × {strip(b.height)}</p>
+          <BoardDiagram board={b} boardWidth={b.width} boardHeight={b.height} />
           <div className="board-stats">
             <span>零件 {fmt(b.partsArea)}</span>
             <span>锯缝 {fmt(b.kerfArea)}</span>
@@ -485,7 +649,9 @@ function ResultView({ result, selected, onToggleDamaged }) {
             )}
           </div>
 
-          {b.cost.shares.length > 0 && (
+          {b.kind === 'remnant' ? (
+            <p className="hint cost-note">余板「{b.remnantId}」为既有库存，<b>本板不计材料费</b>，各订单在本板的零件面积不参与材料费分摊。</p>
+          ) : b.cost.shares.length > 0 && (
             <table className="detail-table cost-table">
               <thead>
                 <tr><th>本板材料费分摊</th><th>零件面积</th><th>面积占比</th><th>分摊额（元）</th></tr>
@@ -563,6 +729,7 @@ function RecutSection({ selectedCount, recut, error, loading, onSubmit }) {
         在上方「分单取件清单」勾选损坏件（按订单号 + 零件名 + 件号三元身份区分，跨订单同名零件互不影响）。
         提交时以当前排料输入重新计算原方案并校验所选件；仅所选件按原始尺寸与原输入顺序
         合并重排为独立补切方案，<b>原方案落位与材料费分摊保持不变</b>。
+        补切<b>独立使用标准新板</b>（按单板价计费），不会重复耗用上方登记的临时余板库存。
       </p>
       <button
         type="button"

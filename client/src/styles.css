@@ -99,6 +99,22 @@ input:focus { outline: 2px solid rgba(37, 99, 235, 0.35); border-color: var(--bl
 .order-no-input { font-weight: 600; }
 
 .parts-list { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+
+/* ---- 临时余板库存编辑 ---- */
+.remnants-list { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.remnant-row {
+  display: grid;
+  grid-template-columns: 1.4fr 0.9fr 0.9fr 34px;
+  gap: 8px;
+  align-items: center;
+}
+.remnant-row-head {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 0 1px;
+  margin: 8px 0 2px;
+}
+
 .part-row {
   display: grid;
   grid-template-columns: 1.4fr 0.8fr 0.8fr 0.7fr 34px;
@@ -182,6 +198,36 @@ input:focus { outline: 2px solid rgba(37, 99, 235, 0.35); border-color: var(--bl
   margin-top: 16px;
 }
 .board-card h3 { margin: 0 0 10px; font-size: 15px; }
+.board-card.remnant-board { border-color: #10b981; background: #f6fef9; }
+.remnant-tag {
+  display: inline-block;
+  margin: 0 4px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: #d1fae5;
+  border: 1px solid #10b981;
+  color: #047857;
+  font-size: 13px;
+  font-weight: 700;
+}
+.board-num.remnant { background: #047857; }
+
+/* ---- 余板耗用情况 ---- */
+.remnant-summary {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 8px;
+}
+@media (max-width: 760px) { .remnant-summary { grid-template-columns: 1fr; } }
+.remnant-group {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px 12px;
+}
+.remnant-group.used { border-color: #10b981; background: #f6fef9; }
+.remnant-group.unused { border-color: #94a3b8; background: #f8fafc; }
+.remnant-group h4 { margin: 0 0 6px; font-size: 13px; color: #334155; }
 
 .board-svg { width: 100%; height: auto; display: block; }
 .remainder-bg { fill: #fef3c7; }
@@ -293,6 +339,7 @@ summary { cursor: pointer; font-size: 13px; color: var(--blue); }
 }
 .cut-limit { font-weight: 600; color: #b45309; }
 .cost-table { margin-top: 10px; }
+.cost-note { margin-top: 10px; padding: 8px 10px; background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 6px; color: #065f46; }
 
 /* ---- 缺件补切 ---- */
 .recut-section {
