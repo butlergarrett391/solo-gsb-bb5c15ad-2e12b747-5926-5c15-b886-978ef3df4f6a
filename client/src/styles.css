@@ -130,6 +130,45 @@ input:focus { outline: 2px solid rgba(37, 99, 235, 0.35); border-color: var(--bl
 .btn.icon { padding: 4px 0; color: #dc2626; }
 .btn.wide { width: 100%; margin-top: 12px; }
 
+/* ---- 临时余板库存 ---- */
+.stock-list { margin-top: 10px; }
+.part-row.stock-row {
+  grid-template-columns: 1.4fr 0.8fr 0.8fr 1.1fr 34px;
+}
+.stock-note-col {
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+}
+.stock-tag {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #f1f5f9;
+  border: 1px solid #cbd5e1;
+  color: #64748b;
+  white-space: nowrap;
+}
+.stock-tag.used {
+  background: #ecfdf5;
+  border-color: #34d399;
+  color: #047857;
+  font-weight: 600;
+}
+.stock-table .stock-unused-row td { color: var(--muted); background: #f8fafc; }
+.stock-cost-hint { margin-top: 8px; color: #047857; }
+
+.board-kind {
+  font-size: 12px;
+  font-weight: 600;
+  margin-left: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.board-kind.stock { background: #ecfdf5; border: 1px solid #34d399; color: #047857; }
+.board-kind.standard { background: #eff6ff; border: 1px solid #93c5fd; color: #1d4ed8; }
+.board-card.stock-board { border-color: #34d399; background: #fcfffe; }
+
 .alert {
   background: var(--danger-bg);
   border: 1px solid var(--danger-border);
@@ -181,7 +220,14 @@ input:focus { outline: 2px solid rgba(37, 99, 235, 0.35); border-color: var(--bl
   padding: 14px;
   margin-top: 16px;
 }
-.board-card h3 { margin: 0 0 10px; font-size: 15px; }
+.board-card h3 {
+  margin: 0 0 10px;
+  font-size: 15px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
 
 .board-svg { width: 100%; height: auto; display: block; }
 .remainder-bg { fill: #fef3c7; }
@@ -286,7 +332,7 @@ summary { cursor: pointer; font-size: 13px; color: var(--blue); }
 }
 
 .board-price {
-  float: right;
+  margin-left: auto;
   font-size: 13px;
   font-weight: 600;
   color: #b45309;

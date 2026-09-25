@@ -3,6 +3,12 @@ import BoardDiagram, { partColor } from './BoardDiagram.jsx';
 
 const SAMPLE_BOARD = { boardWidth: 2440, boardHeight: 1220, kerf: 3, boardPrice: 180 };
 
+// 临时余板库存（每块带唯一编号，长 / 宽均为正数；每块最多使用一次）
+const SAMPLE_STOCKS = [
+  { id: 'YB-01', width: 1200, height: 800 },
+  { id: 'YB-02', width: 320, height: 150 }, // 示例中放不进任何零件，展示“未用”状态
+];
+
 const SAMPLE_ORDERS = [
   {
     orderNo: 'SO-1001',
@@ -24,6 +30,7 @@ const SAMPLE_ORDERS = [
 
 const EMPTY_PART = { name: '', width: '', height: '', quantity: 1 };
 const emptyOrder = (i) => ({ orderNo: '', parts: [{ ...EMPTY_PART }] });
+const EMPTY_STOCK = { id: '', width: '', height: '' };
 
 // 损坏件三元身份：订单号 + 零件名 + 件号（跨订单同名零件互不影响）
 const itemKey = (order, part, index) => JSON.stringify([order, part, index]);
@@ -42,6 +49,7 @@ export default function App() {
   const [kerf, setKerf] = useState(String(SAMPLE_BOARD.kerf));
   const [boardPrice, setBoardPrice] = useState(String(SAMPLE_BOARD.boardPrice));
   const [maxCutLength, setMaxCutLength] = useState('');
+  const [stocks, setStocks] = useState(SAMPLE_STOCKS.map((s) => ({ ...s })));
   const [orders, setOrders] = useState(SAMPLE_ORDERS.map((o) => ({
     orderNo: o.orderNo,
     parts: o.parts.map((p) => ({ ...p })),
@@ -79,6 +87,13 @@ export default function App() {
     }));
   };
 
+  // ---- 临时余板库存行编辑（允许清空到 0 行；提交时空行被忽略，非空行必须完整）----
+  const updateStock = (si, key, value) => {
+    setStocks((prev) => prev.map((s, idx) => (idx === si ? { ...s, [key]: value } : s)));
+  };
+  const addStock = () => setStocks((prev) => [...prev, { ...EMPTY_STOCK }]);
+  const removeStock = (si) => setStocks((prev) => prev.filter((_, idx) => idx !== si));
+
   const resetRecut = () => {
     setSelected(new Set());
     setRecut(null);
@@ -91,35 +106,63 @@ export default function App() {
     setKerf(String(SAMPLE_BOARD.kerf));
     setBoardPrice(String(SAMPLE_BOARD.boardPrice));
     setMaxCutLength('');
+    setStocks(SAMPLE_STOCKS.map((s) => ({ ...s })));
     setOrders(SAMPLE_ORDERS.map((o) => ({ orderNo: o.orderNo, parts: o.parts.map((p) => ({ ...p })) })));
     setResult(null);
     setError('');
     resetRecut();
   };
 
-  const currentPayload = () => ({
-    boardWidth: Number(boardWidth),
-    boardHeight: Number(boardHeight),
-    kerf: kerf === '' ? 0 : Number(kerf),
-    boardPrice: boardPrice === '' ? 0 : Number(boardPrice),
-    // 留空不下发该字段：后端按不限制处理，沿用现有排料规则
-    ...(maxCutLength.trim() !== '' ? { maxCutLength: Number(maxCutLength) } : {}),
-    orders: orders.map((o) => ({
-      orderNo: o.orderNo,
-      parts: o.parts.map((p) => ({
-        name: p.name,
-        width: Number(p.width),
-        height: Number(p.height),
-        quantity: Number(p.quantity),
+  // 组装请求载荷并校验余板行：全空行忽略；非空行必须编号唯一且长 / 宽为正数
+  const buildPayload = () => {
+    const seenIds = new Set();
+    const stockBoards = [];
+    for (let i = 0; i < stocks.length; i++) {
+      const s = stocks[i];
+      const id = String(s.id ?? '').trim();
+      const ws = String(s.width).trim();
+      const hs = String(s.height).trim();
+      if (id === '' && ws === '' && hs === '') continue; // 空行不下发
+      if (id === '') return { error: `第 ${i + 1} 块余板缺少唯一编号` };
+      if (seenIds.has(id)) return { error: `余板编号重复：${id}` };
+      const w = Number(ws);
+      const h = Number(hs);
+      if (!Number.isFinite(w) || w <= 0) return { error: `余板「${id}」的长度必须为正数` };
+      if (!Number.isFinite(h) || h <= 0) return { error: `余板「${id}」的宽度必须为正数` };
+      seenIds.add(id);
+      stockBoards.push({ id, width: w, height: h });
+    }
+    const payload = {
+      boardWidth: Number(boardWidth),
+      boardHeight: Number(boardHeight),
+      kerf: kerf === '' ? 0 : Number(kerf),
+      boardPrice: boardPrice === '' ? 0 : Number(boardPrice),
+      // 留空不下发该字段：后端按不限制处理，沿用现有排料规则
+      ...(maxCutLength.trim() !== '' ? { maxCutLength: Number(maxCutLength) } : {}),
+      stockBoards,
+      orders: orders.map((o) => ({
+        orderNo: o.orderNo,
+        parts: o.parts.map((p) => ({
+          name: p.name,
+          width: Number(p.width),
+          height: Number(p.height),
+          quantity: Number(p.quantity),
+        })),
       })),
-    })),
-  });
+    };
+    return { payload };
+  };
 
   const submit = async (e) => {
     e.preventDefault();
     setError('');
     if (!validateMaxCut(maxCutLength)) {
       setError('设备最大单刀长度必须为正数（留空则不限制）');
+      return;
+    }
+    const { payload, error: stockError } = buildPayload();
+    if (stockError) {
+      setError(stockError);
       return;
     }
     setResult(null);
@@ -129,7 +172,7 @@ export default function App() {
       const res = await fetch('/api/cut', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(currentPayload()),
+        body: JSON.stringify(payload),
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
@@ -161,6 +204,11 @@ export default function App() {
       setRecutError('设备最大单刀长度必须为正数（留空则不限制）');
       return;
     }
+    const { payload, error: stockError } = buildPayload();
+    if (stockError) {
+      setRecutError(stockError);
+      return;
+    }
     setRecut(null);
     setRecutLoading(true);
     // 按分单取件清单顺序收集选中的损坏件（三元身份）
@@ -173,11 +221,12 @@ export default function App() {
       }
     }
     try {
-      // 提交时以当前排料输入为准，后端重新计算原方案并校验所选件
+      // 提交时以当前排料输入为准，后端重新计算原方案并校验所选件；
+      // 余板库存仍随原方案提交（后端重算原方案用），补切本身只开标准新板
       const res = await fetch('/api/recut', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...currentPayload(), damaged }),
+        body: JSON.stringify({ ...payload, damaged }),
       });
       const data = await res.json();
       if (!res.ok || !data.ok) {
@@ -196,7 +245,7 @@ export default function App() {
     <div className="page">
       <header className="site-header">
         <h1>矩形板材下料 · 多订单拼版断头切割排料</h1>
-        <p>多张订单混合拼版：按订单与零件行顺序断头切割，结果保留订单归属，按单取件并分摊材料费；损坏件可勾选后生成独立补切方案</p>
+        <p>多张订单混合拼版：按订单与零件行顺序断头切割，可登记带唯一编号的临时余板库存（已开板放不下时先用余板、最后开标准新板），结果保留订单归属，按单取件并分摊材料费；损坏件可勾选后生成独立补切方案</p>
       </header>
 
       <main className="layout">
@@ -238,6 +287,49 @@ export default function App() {
               系统会对每个候选落位与朝向分别核算竖切优先、横切优先的实际刀长，
               只有该切法<b>每一刀均不超过此上限</b>才会采用，不输出超限刀路。
             </p>
+
+            <div className="parts-head">
+              <h2>临时余板库存（{stocks.length}）</h2>
+            </div>
+            <p className="hint">
+              选填。每块余板填写<b>唯一编号</b>与实际<b>长 × 宽</b>（均为正数）。
+              排料仍按零件顺序：先在所有已开板的可用矩形中找落位；找不到时
+              <b>按此处输入顺序</b>尝试尚未使用且能加工的余板（每块最多使用一次，同样遵守锯缝、旋转与单刀长度限制）；
+              最后才开标准新板。<b>余板不计材料费</b>，材料费只对新增标准板分摊；缺件补切只开标准新板，不耗用余板。
+            </p>
+            <div className="stock-list">
+              {stocks.length > 0 && (
+                <div className="part-row part-row-head stock-row">
+                  <span>余板编号</span>
+                  <span>长度</span>
+                  <span>宽度</span>
+                  <span className="stock-note-col">状态</span>
+                  <span className="op-col"></span>
+                </div>
+              )}
+              {stocks.map((s, si) => {
+                const used = result?.stockUsed?.find((u) => u.id === String(s.id).trim());
+                return (
+                  <div className="part-row stock-row" key={si}>
+                    <input type="text" value={s.id} placeholder="如 YB-01（唯一）"
+                      onChange={(e) => updateStock(si, 'id', e.target.value)} />
+                    <input type="number" step="any" min="0" value={s.width}
+                      onChange={(e) => updateStock(si, 'width', e.target.value)} />
+                    <input type="number" step="any" min="0" value={s.height}
+                      onChange={(e) => updateStock(si, 'height', e.target.value)} />
+                    <span className="stock-note-col">
+                      {used ? <span className="stock-tag used">已用 · 第 {used.board} 板</span>
+                        : result ? <span className="stock-tag">未用</span> : null}
+                    </span>
+                    <button type="button" className="btn icon op-col" title="删除该余板"
+                      onClick={() => removeStock(si)}>✕</button>
+                  </div>
+                );
+              })}
+              <button type="button" className="btn ghost wide" onClick={addStock}>
+                ＋ 添加余板
+              </button>
+            </div>
 
             <div className="parts-head">
               <h2>订单清单（{orders.length}）</h2>
@@ -310,10 +402,12 @@ export default function App() {
               <p>填写左侧订单与零件后点击「生成多订单裁切方案」。</p>
               <ul>
                 <li>多个订单的零件混合拼版，按订单 / 零件行输入顺序断头切割</li>
+                <li>可登记带唯一编号的临时余板库存：已开板放不下时按输入顺序先试余板、最后才开标准新板</li>
+                <li>逐板裁切图按实际板尺寸绘制，余板不计材料费，列出余板已用 / 未用编号与新增标准板数</li>
                 <li>逐板裁切图、零件落位表与刀序继续可用，色块左上角标注订单号</li>
                 <li>结果按订单列出跨板件号、所在板号与坐标，方便分单取件</li>
                 <li>每板材料费按订单零件面积比例分摊（最大余数法分配分位尾差）</li>
-                <li>在分单取件清单勾选损坏件，可生成独立的缺件补切方案</li>
+                <li>在分单取件清单勾选损坏件，可生成独立的缺件补切方案（补切只开标准新板，不耗用余板）</li>
               </ul>
             </div>
           )}
@@ -345,18 +439,20 @@ function ResultView({ result, selected, onToggleDamaged }) {
     <>
       <h2>排料结果</h2>
       <div className="stat-grid">
-        <div className="stat"><b>{result.boardsCount}</b><span>用板数</span></div>
+        <div className="stat"><b>{result.boardsCount}</b><span>用板总数（余板 {result.stockUsed.length} + 新板 {result.standardBoardsCount}）</span></div>
+        <div className="stat accent"><b>{result.standardBoardsCount}</b><span>新增标准板数</span></div>
         <div className="stat"><b>{fmt(result.totalParts)}</b><span>零件总数</span></div>
         <div className="stat"><b>{fmt(result.partsArea)}</b><span>零件总面积</span></div>
         <div className="stat"><b>{fmt(result.kerfArea)}</b><span>锯缝损耗面积</span></div>
         <div className="stat accent"><b>{fmt(result.remainderArea)}</b><span>余料总面积</span></div>
         <div className="stat"><b>{result.utilization}%</b><span>总利用率</span></div>
-        <div className="stat accent"><b>¥{yuan(result.totalMaterialCents)}</b><span>材料费合计（{result.orders.length} 单）</span></div>
+        <div className="stat accent"><b>¥{yuan(result.totalMaterialCents)}</b><span>材料费合计（仅 {result.standardBoardsCount} 张新板，{result.orders.length} 单）</span></div>
       </div>
       <p className="hint">
-        原板 {strip(result.boardWidth)} × {strip(result.boardHeight)}，
+        标准原板 {strip(result.boardWidth)} × {strip(result.boardHeight)}，
         单板材料价 ¥{yuan(result.boardPrice * 100)}；
-        每板按各订单零件实际面积比例分摊，分位尾差用最大余数法（同余按订单输入顺序）。
+        <b>余板库存不计材料费</b>，仅新增标准新板按单板价计费，
+        每板再按各订单零件实际面积比例分摊，分位尾差用最大余数法（同余按订单输入顺序）。
         {result.maxCutLength != null ? (
           <>
             <br />
@@ -370,6 +466,42 @@ function ResultView({ result, selected, onToggleDamaged }) {
           </>
         )}
       </p>
+
+      {/* 临时余板库存耗用情况 */}
+      {result.stockBoards.length > 0 && (
+        <>
+          <h2 className="section-title">临时余板库存耗用</h2>
+          <table className="detail-table stock-table">
+            <thead>
+              <tr><th>状态</th><th>余板编号</th><th>实际尺寸 长×宽</th><th>输入序号</th><th>所在板号</th></tr>
+            </thead>
+            <tbody>
+              {result.stockUsed.map((s) => (
+                <tr key={`u-${s.id}`}>
+                  <td><span className="stock-tag used">已用</span></td>
+                  <td>{s.id}</td>
+                  <td>{strip(s.width)} × {strip(s.height)}</td>
+                  <td>第 {s.inputIndex} 块</td>
+                  <td><span className="board-num">{s.board}</span></td>
+                </tr>
+              ))}
+              {result.stockUnused.map((s) => (
+                <tr key={`n-${s.id}`} className="stock-unused-row">
+                  <td><span className="stock-tag">未用</span></td>
+                  <td>{s.id}</td>
+                  <td>{strip(s.width)} × {strip(s.height)}</td>
+                  <td>第 {s.inputIndex} 块</td>
+                  <td>—</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p className="hint">
+            共录入 {result.stockBoards.length} 块余板：已用 {result.stockUsed.length} 块、
+            未用 {result.stockUnused.length} 块；每块余板最多使用一次，未用余板原样保留库存、不产生费用。
+          </p>
+        </>
+      )}
 
       {/* 分单取件 */}
       <h2 className="section-title">分单取件清单</h2>
@@ -448,7 +580,7 @@ function ResultView({ result, selected, onToggleDamaged }) {
             <td>合计</td>
             <td>{result.totalParts}</td>
             <td>{fmt(result.partsArea)}</td>
-            <td>{result.boardsCount} 张板</td>
+            <td>{result.boardsCount} 张板（余板 {result.stockUsed.length} · 新板 {result.standardBoardsCount}）</td>
             <td>¥{yuan(result.totalMaterialCents)}</td>
           </tr>
         </tbody>
@@ -466,14 +598,19 @@ function ResultView({ result, selected, onToggleDamaged }) {
         ))}
       </div>
 
-      {/* 逐板图与刀序 */}
+      {/* 逐板图与刀序（按每块板的实际尺寸绘图：余板尺寸可能与标准板不同）*/}
       {result.boards.map((b) => (
-        <div className="board-card" key={b.index}>
+        <div className={`board-card ${b.kind === 'stock' ? 'stock-board' : ''}`} key={b.index}>
           <h3>
             第 {b.index} 张板 / 共 {result.boardsCount} 张
-            <span className="board-price">板价 ¥{yuan(b.cost.priceCents)}</span>
+            {b.kind === 'stock' ? (
+              <span className="board-kind stock">余板 {b.stockId}（{strip(b.width)} × {strip(b.height)}，不计材料费）</span>
+            ) : (
+              <span className="board-kind standard">新增标准板（{strip(b.width)} × {strip(b.height)}）</span>
+            )}
+            {b.kind === 'standard' && <span className="board-price">板价 ¥{yuan(b.cost.priceCents)}</span>}
           </h3>
-          <BoardDiagram board={b} boardWidth={result.boardWidth} boardHeight={result.boardHeight} />
+          <BoardDiagram board={b} boardWidth={b.width} boardHeight={b.height} />
           <div className="board-stats">
             <span>零件 {fmt(b.partsArea)}</span>
             <span>锯缝 {fmt(b.kerfArea)}</span>
@@ -485,7 +622,7 @@ function ResultView({ result, selected, onToggleDamaged }) {
             )}
           </div>
 
-          {b.cost.shares.length > 0 && (
+          {b.kind === 'standard' && b.cost.shares.length > 0 && (
             <table className="detail-table cost-table">
               <thead>
                 <tr><th>本板材料费分摊</th><th>零件面积</th><th>面积占比</th><th>分摊额（元）</th></tr>
@@ -507,6 +644,9 @@ function ResultView({ result, selected, onToggleDamaged }) {
                 </tr>
               </tbody>
             </table>
+          )}
+          {b.kind === 'stock' && (
+            <p className="hint stock-cost-hint">余板库存板不收取材料费，本板零件不产生新的材料分摊。</p>
           )}
 
           <details>
@@ -562,7 +702,8 @@ function RecutSection({ selectedCount, recut, error, loading, onSubmit }) {
       <p className="hint">
         在上方「分单取件清单」勾选损坏件（按订单号 + 零件名 + 件号三元身份区分，跨订单同名零件互不影响）。
         提交时以当前排料输入重新计算原方案并校验所选件；仅所选件按原始尺寸与原输入顺序
-        合并重排为独立补切方案，<b>原方案落位与材料费分摊保持不变</b>。
+        合并重排为独立补切方案，<b>补切只开标准新板、不耗用临时余板库存</b>，
+        <b>原方案落位与材料费分摊保持不变</b>。
       </p>
       <button
         type="button"
@@ -661,10 +802,11 @@ function RecutResult({ recut }) {
       {recut.boards.map((b) => (
         <div className="board-card recut-board" key={b.index}>
           <h3>
-            补切新板 第 {b.index} 张 / 共 {recut.addedBoards} 张
+            补切标准新板 第 {b.index} 张 / 共 {recut.addedBoards} 张
+            <span className="board-kind standard">{strip(b.width)} × {strip(b.height)}（独立补切，不耗用余板库存）</span>
             <span className="board-price">板价 ¥{yuan(b.cost.priceCents)}</span>
           </h3>
-          <BoardDiagram board={b} boardWidth={recut.boardWidth} boardHeight={recut.boardHeight} />
+          <BoardDiagram board={b} boardWidth={b.width} boardHeight={b.height} />
           <div className="board-stats">
             <span>零件 {fmt(b.partsArea)}</span>
             <span>锯缝 {fmt(b.kerfArea)}</span>

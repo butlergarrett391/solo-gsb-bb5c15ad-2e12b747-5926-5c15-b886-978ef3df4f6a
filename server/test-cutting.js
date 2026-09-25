@@ -476,4 +476,173 @@ try {
     '补切超限错误应指出订单 / 零件 / 件号：' + e.message);
 }
 
+// 25) 临时余板库存：已开板优先 → 未用余板（按输入顺序）→ 标准新板；余板最多用一次
+const stBase = {
+  boardWidth: 1200, boardHeight: 800, kerf: 0, boardPrice: 100,
+  stockBoards: [
+    { id: 'S1', width: 700, height: 500 },
+    { id: 'S2', width: 1200, height: 800 },
+  ],
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 10 }] }],
+};
+const st = cutBoards(stBase);
+// 第1件无已开板 → 先开余板 S1（仅放1件）；第2件 S1 余料放不下 → 开余板 S2（放4件）；
+// 之后才开标准新板 2 张（4+1 件）
+assert.strictEqual(st.boardsCount, 4);
+assert.strictEqual(st.standardBoardsCount, 2);
+assert.deepStrictEqual(st.boards.map((b) => [b.kind, b.stockId || null, b.placements.length]),
+  [['stock', 'S1', 1], ['stock', 'S2', 4], ['standard', null, 4], ['standard', null, 1]]);
+assert.deepStrictEqual(st.stockUsed.map((s) => [s.id, s.board]), [['S1', 1], ['S2', 2]]);
+assert.deepStrictEqual(st.stockUnused, []);
+// 材料费只对新增标准板收取（2 × 100 元）
+assert.strictEqual(st.totalMaterialCents, 20000);
+assert.deepStrictEqual(st.boards.map((b) => b.cost.priceCents), [0, 0, 10000, 10000]);
+// 总面积按各板实际尺寸：700×500 + 1200×800×3
+assert.strictEqual(st.totalArea, 700 * 500 + 1200 * 800 * 3);
+for (const b of st.boards) {
+  assert(Math.abs(b.width * b.height - b.partsArea - b.kerfArea - b.remainderArea) < 0.01,
+    `板 ${b.index} 面积不守恒`);
+  assert.strictEqual(b.width, b.kind === 'stock' && b.stockId === 'S1' ? 700 : 1200);
+  assert.strictEqual(b.height, b.kind === 'stock' && b.stockId === 'S1' ? 500 : 800);
+}
+// 回显库存输入
+assert.deepStrictEqual(st.stockBoards, [
+  { id: 'S1', width: 700, height: 500 },
+  { id: 'S2', width: 1200, height: 800 },
+]);
+
+// 26) 已开板（含已启用余板）的可用矩形优先于新余板：小料填入 S1 余料，不再开新板
+const reuse = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 0, boardPrice: 100,
+  stockBoards: [{ id: 'R1', width: 700, height: 500 }],
+  orders: [{ orderNo: 'A', parts: [
+    { name: '大块', width: 600, height: 400, quantity: 1 },
+    { name: '小条', width: 80, height: 400, quantity: 1 }, // 可入 S1 右侧 100×500 余料
+  ] }],
+});
+assert.strictEqual(reuse.boardsCount, 1, '应复用已启用余板');
+assert.strictEqual(reuse.boards[0].kind, 'stock');
+assert.strictEqual(reuse.boards[0].placements.length, 2);
+assert.strictEqual(reuse.standardBoardsCount, 0);
+assert.strictEqual(reuse.totalMaterialCents, 0);
+
+// 27) 按输入顺序尝试余板，跳过放不下的；放不下的保留为未用
+const skip = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 0, boardPrice: 50,
+  stockBoards: [
+    { id: 'T1', width: 300, height: 300 }, // 放不下 600×400
+    { id: 'T2', width: 1000, height: 500 }, // 可以
+  ],
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 1 }] }],
+});
+assert.strictEqual(skip.boardsCount, 1);
+assert.strictEqual(skip.boards[0].stockId, 'T2');
+assert.deepStrictEqual(skip.stockUsed.map((s) => s.id), ['T2']);
+assert.deepStrictEqual(skip.stockUnused.map((s) => s.id), ['T1']);
+assert.strictEqual(skip.totalMaterialCents, 0);
+
+// 28) 每块余板最多使用一次：2 件 + 1 块只能放 1 件的余板 → 余板 1 张 + 标准新板 1 张
+const once = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 0, boardPrice: 80,
+  stockBoards: [{ id: 'U1', width: 700, height: 500 }], // 余料窄条放不进第二件 600×400
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 2 }] }],
+});
+assert.strictEqual(once.boardsCount, 2);
+assert.strictEqual(once.boards[0].kind, 'stock');
+assert.strictEqual(once.boards[1].kind, 'standard');
+assert.strictEqual(once.standardBoardsCount, 1);
+assert.strictEqual(once.totalMaterialCents, 8000);
+
+// 29) 余板允许旋转落料：零件 1000×700 正向放不下 800×1100，旋转后 700×1000 可以
+const stRot = cutBoards({
+  boardWidth: 600, boardHeight: 600, kerf: 0,
+  stockBoards: [{ id: 'Q1', width: 800, height: 1100 }],
+  orders: [{ orderNo: 'A', parts: [{ name: '横条', width: 1000, height: 700, quantity: 1 }] }],
+});
+assert.strictEqual(stRot.boardsCount, 1);
+assert.strictEqual(stRot.boards[0].stockId, 'Q1');
+assert.strictEqual(stRot.boards[0].placements[0].rotated, true);
+
+// 30) 单刀长度限制：跳过超限余板，选后续可行余板；都不可行才开标准新板
+const stLim = cutBoards({
+  boardWidth: 1000, boardHeight: 800, kerf: 3, boardPrice: 100, maxCutLength: 700,
+  stockBoards: [
+    { id: 'L1', width: 1000, height: 800 }, // 与标准板同尺寸：600×300 两种切法最短也需 800 刀 → 超限
+    { id: 'L2', width: 603, height: 303 },  // 恰好容纳 600×300，竖切 303、横切 600 均 ≤ 700
+  ],
+  orders: [{ orderNo: 'A', parts: [{ name: 'a', width: 600, height: 300, quantity: 1 }] }],
+});
+assert.strictEqual(stLim.boardsCount, 1);
+assert.strictEqual(stLim.boards[0].stockId, 'L2');
+assert.deepStrictEqual(stLim.stockUsed.map((s) => s.id), ['L2']);
+assert.deepStrictEqual(stLim.stockUnused.map((s) => s.id), ['L1']);
+assert(stLim.boards[0].longestCut <= 700 + 1e-6);
+assert.strictEqual(stLim.totalMaterialCents, 0);
+// 所有余板均超限时回退标准新板（标准板同样超限则整体报错）
+const stLimStd = cutBoards({
+  boardWidth: 603, boardHeight: 303, kerf: 3, maxCutLength: 700,
+  stockBoards: [{ id: 'L3', width: 1000, height: 800 }],
+  orders: [{ orderNo: 'A', parts: [{ name: 'a', width: 600, height: 300, quantity: 1 }] }],
+});
+assert.strictEqual(stLimStd.boards[0].kind, 'standard');
+assert.deepStrictEqual(stLimStd.stockUnused.map((s) => s.id), ['L3']);
+assert.strictEqual(stLimStd.totalMaterialCents, stLimStd.boardPrice * 100);
+assert.throws(() => cutBoards({
+  boardWidth: 1000, boardHeight: 800, kerf: 3, maxCutLength: 700,
+  stockBoards: [{ id: 'L4', width: 1000, height: 800 }],
+  orders: [{ orderNo: 'A', parts: [{ name: 'a', width: 600, height: 300, quantity: 1 }] }],
+}), UserError);
+
+// 31) 余板库存输入校验：编号缺失 / 重复、尺寸非正
+assert.throws(() => cutBoards({
+  boardWidth: 1000, boardHeight: 1000,
+  stockBoards: [{ width: 10, height: 10 }],
+  orders: [{ orderNo: 'X', parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }] }],
+}), UserError, '余板缺编号应报错');
+assert.throws(() => cutBoards({
+  boardWidth: 1000, boardHeight: 1000,
+  stockBoards: [
+    { id: 'DUP', width: 10, height: 10 },
+    { id: 'DUP', width: 20, height: 20 },
+  ],
+  orders: [{ orderNo: 'X', parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }] }],
+}), UserError, '余板编号重复应报错');
+assert.throws(() => cutBoards({
+  boardWidth: 1000, boardHeight: 1000,
+  stockBoards: [{ id: 'Z', width: 0, height: 10 }],
+  orders: [{ orderNo: 'X', parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }] }],
+}), UserError, '余板长度非正应报错');
+assert.throws(() => cutBoards({
+  boardWidth: 1000, boardHeight: 1000,
+  stockBoards: [{ id: 'Z', width: 10, height: -2 }],
+  orders: [{ orderNo: 'X', parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }] }],
+}), UserError, '余板宽度非正应报错');
+
+// 32) 零件旋转后仍大于标准板、但能放入某块余板时允许排料；标准板与所有余板都放不下才报错
+const onlyStock = cutBoards({
+  boardWidth: 500, boardHeight: 300, kerf: 0,
+  stockBoards: [{ id: 'BIG', width: 700, height: 700 }],
+  orders: [{ orderNo: 'A', parts: [{ name: '大方', width: 600, height: 600, quantity: 1 }] }],
+});
+assert.strictEqual(onlyStock.boards[0].stockId, 'BIG');
+assert.throws(() => cutBoards({
+  boardWidth: 500, boardHeight: 300, kerf: 0,
+  stockBoards: [{ id: 'SMALL', width: 400, height: 400 }],
+  orders: [{ orderNo: 'A', parts: [{ name: '大方', width: 600, height: 600, quantity: 1 }] }],
+}), UserError);
+
+// 33) 补切独立使用标准新板，不耗用余板库存；原方案 / 补切材料费只数标准板
+const rcSt = recutBoards({
+  ...stBase,
+  damaged: [{ order: 'A', part: '块', index: 1 }],
+});
+assert.deepStrictEqual(rcSt.original, cutBoards(stBase));
+assert.strictEqual(rcSt.recut.addedBoards, 1);
+assert.strictEqual(rcSt.recut.addedMaterialCents, 10000);
+assert.strictEqual(rcSt.recut.boards[0].kind, 'standard');
+assert.strictEqual(rcSt.recut.boards[0].cost.priceCents, 10000);
+for (const b of rcSt.recut.boards) assert.strictEqual(b.kind, 'standard', '补切不得使用余板');
+// 原方案库存耗用不受补切影响
+assert.deepStrictEqual(rcSt.original.stockUsed.map((s) => s.id), ['S1', 'S2']);
+
 console.log('全部算法自检通过 ✔');
